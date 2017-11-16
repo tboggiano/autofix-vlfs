@@ -1,139 +1,192 @@
-----------------------------------------------------------------------------------
--- Procedure Name: VLF_AutoFix
---
--- Desc: Runs VLF_Fix if Ideal VLFCount is over 100 and VLFCount over IdealCount + @VLFIdealOver 
---
---
--- Notes:  Recommendations are to have each VLF be no more than 512 MBs 
---	http://www.sqlskills.com/blogs/kimberly/transaction-log-vlfs-too-many-or-too-few/
---	chunks less than 64MB and up to 64MB = 4 VLFs
---	chunks larger than 64MB and up to 1GB = 8 VLFs
---	chunks larger than 1GB = 16 VLFs
---	ideal size for a VLF 512 MBs, 20 to 30 VLfs , 50 high mark
---  https://www.sqlskills.com/blogs/paul/important-change-vlf-creation-algorithm-sql-server-2014/
---  Algorithms update for 2014 and up
---  Is the growth size less than 1/8 the size of the current log size?
---  Yes: create 1 new VLF equal to the growth size
---  No: use the formula above
-----------------------------------------------------------------------------------
-CREATE PROCEDURE dbo.VLF_AutoFix
+CREATE PROCEDURE dbo.VLF_Fix
 (
-	@LookBackTime INT = 60 , -- Number of minutes to look back in the XE to see if things have changed
-	@VLFIdealOver INT = 20 , -- Number of over the Ideal number of VLFs is OK
-	@VLFCountMin INT = 100 , -- The minimum of VLFs the log has to have to try to fix it
-	@VLFIdealSize INT = 512 , -- Ideal size of each VLF
-	@HoursSinceLastFix INT = 6 , -- Number of hours since the last time it tried to fix it
-	@MaxIncrementSizeMB INT = 8192, -- Size to increase by, in 2012 and below this 8192 gives is our 512
-	@LogBackJobName sysname --Name of log backup job on server
-)
-AS
+	@DBName sysname,
+	@StopTimeSecs INT = 600,
+	@DelayIncrementSecs INT = 1,
+	@TargetLogSizeMB INT,
+	@IncrementSizeMB FLOAT = 8192,
+	@LogBackJobName sysname
+) 
+AS  
 SET NOCOUNT ON
 
+DECLARE @Delay INT
+DECLARE @DelayTime DATETIME
+DECLARE @CutOffTime DATETIME
+DECLARE @sqlcmd NVARCHAR(MAX)
+DECLARE @DBCCQuery VARCHAR(99)
+DECLARE @LoopCtr INT
+DECLARE @StepMB INT
+DECLARE @LogName sysname
+DECLARE @CurrentLogFileSizeMB INT
+DECLARE @VLFCount INT
+DECLARE @DBRecoveryModel CHAR(1)
+DECLARE @SQLExceptionMsg VARCHAR(MAX)
+
 CREATE TABLE #VLFInfo
+    (
+      RecoveryUnitId TINYINT ,
+      FileId TINYINT ,
+      FileSize BIGINT ,
+      StartOffset BIGINT ,
+      FSeqNo INT ,
+      [Status] TINYINT ,
+      Parity TINYINT ,
+      CreateLSN NUMERIC(25, 0)
+    )
+    
+-- Set the stop time for the loop
+SET @CutOffTime = DATEADD(s,@StopTimeSecs,GETDATE())
+SET @Delay = 0
+	
+-- Get the recovery model for the database
+SET @DBRecoveryModel = ( SELECT ( CASE WHEN d.recovery_model = 3 THEN 'S' ELSE 'F' END  ) FROM sys.databases AS d WHERE d.name = @DBName )
+
+-- Build SQL command for shrink loop
+SET @sqlcmd = 
 (
-	RecoveryUnitID INT ,
-	FileID INT ,
-	FileSize BIGINT ,
-	StartOffset BIGINT ,
-	FSeqNo BIGINT ,
-	[Status] BIGINT ,
-	Parity BIGINT ,
-	CreateLSN NUMERIC(38)
-);
-	 
-CREATE TABLE #VLFCountResults
-	(
-		DatabaseName SYSNAME ,
-		VLFCount INT ,
-		LogFileSize BIGINT
-	);
-
-CREATE TABLE #Events ( DatabaseName SYSNAME );
-CREATE TABLE #LogFileSize ( LogFileSizeMB INT );
-
-DECLARE @DBName SYSNAME ,
-	@LogFileSize INT ,
-	@IncrementSizeMB INT ,
-	@VLFCount INT ,
-	@SQL NVARCHAR(MAX),
-	@return_status int,
-	@CurrentLogFileSize INT;
-
-DECLARE vlfcursor CURSOR READ_ONLY
-FOR
-	SELECT  DBName ,
-			NumOfVLFs ,
-			LogSizeMB 
-	FROM    dbo.VLFInfo 
-	WHERE   NumOfVLFs > @VLFCountMin
-			AND NumOfVLFs - ( LogSizeMB / @VLFIdealSize ) >= @VLFIdealOver  ;
-OPEN vlfcursor;
-
-FETCH NEXT FROM vlfcursor INTO @DBName, @VLFCount, @LogFileSize ;
-WHILE ( @@fetch_status <> -1 )
+    SELECT REPLACE('
+        USE [{{@dbname}}];
+        CHECKPOINT;
+        '
+        ,'{{@dbname}}',@DBName)
+) +   
+	+
+	REPLACE(REPLACE(
+	'
+	SELECT 1
+	WHILE @@RowCount > 0
 	BEGIN
-		IF ( @@fetch_status <> -2 )
-			BEGIN
-				--Query  to see if log files has been grown in the last @LookBackTime Minutes
-				WITH    Data
-							AS ( SELECT   CAST(target_data AS XML) AS TargetData
-								FROM     sys.dm_xe_session_targets dt
-										INNER JOIN sys.dm_xe_sessions ds ON ds.address = dt.event_session_address
-								WHERE    dt.target_name = N'ring_buffer'
-										AND ds.Name = N'XE_DatabaseSizeChangeEvents'
-								)
-				INSERT INTO #Events
-				SELECT  XEventData.XEvent.value('(action[@name="database_name"]/value)[1]', 'SYSNAME') AS DatabaseName
-				FROM    Data d
-						CROSS APPLY TargetData.nodes('RingBufferTarget/event[@name=''database_file_size_change'']')
-						AS XEventData ( XEvent )
-				WHERE   XEventData.XEvent.value('(@timestamp)[1]', 'datetime2') > CONVERT(DATETIME2, DATEADD(MINUTE, -1 * @LookBackTime, GETDATE()))
-						AND XEventData.XEvent.value('(data[@name="file_type"]/text)[1]', 'NVARCHAR(120)') = N'Log file'
-						AND XEventData.XEvent.value('(action[@name="database_name"]/value)[1]', 'SYSNAME') = @DBName;
+		SELECT	1
+		FROM	msdb.dbo.sysjobs_view job
+				INNER JOIN msdb.dbo.sysjobactivity activity
+					ON job.job_id = activity.job_id
+		WHERE	job.name = "{{JobName}}"
+				AND start_execution_date IS NOT NULL
+				AND stop_execution_date IS NULL
+		ORDER BY start_execution_date DESC
+	END '
+	,'"', '''')
+	,'{{JobName}}', @LogBackJobName)
+	 + 
+	REPLACE(REPLACE('
+	EXEC msdb.dbo.sp_start_job "{{JobName}}"'
+	,'"', '''')
+	,'{{JobName}}', @LogBackJobName)
+	+
+	REPLACE(REPLACE(
+	'
+	SELECT 1
+	WHILE @@RowCount > 0
+	BEGIN
+		SELECT	1
+		FROM	msdb.dbo.sysjobs_view job
+				INNER JOIN msdb.dbo.sysjobactivity activity
+					ON job.job_id = activity.job_id
+		WHERE	job.name = "{{JobName}}"
+				AND start_execution_date IS NOT NULL
+				AND stop_execution_date IS NULL
+		ORDER BY start_execution_date DESC
+	END'
+	,'"', '''')
+	,'{{JobName}}', @LogBackJobName)
+	 +
+(
+    SELECT REPLACE('
+        DBCC SHRINKFILE ({{file_id}} , 0, TRUNCATEONLY) WITH NO_INFOMSGS;
+        CHECKPOINT;
+		DBCC SHRINKFILE ({{file_id}} , 0) WITH NO_INFOMSGS;
+        '
+        ,'{{file_id}}', CONVERT(VARCHAR(99), [file_id]))
+    FROM master.sys.master_files
+    WHERE type_desc = 'log'
+		AND DB_NAME(database_id) = @DBName
+) + '
+CHECKPOINT;
+'
 
-				--If no growths in last @LookBackTime * -1 minutes then VLF and this process has not been run on this DB in the last @HoursSinceLastFix
-				IF @@ROWCOUNT = 0 AND NOT EXISTS (SELECT 1 FROM dbo.VLFAutoFix WHERE DBName = @DBName AND LogDate>= DATEADD(HOUR, @HoursSinceLastFix * -1, GETDATE()))
-					BEGIN
-						IF @LogFileSize >= @MaxIncrementSizeMB -- 512 MB limit on VLF size, creates 16 VLFs per growth
-							SET @IncrementSizeMB = @MaxIncrementSizeMB;
-						ELSE
-							SET @IncrementSizeMB = @LogFileSize;  -- Else grow back to original size using size as increment value
-						
-						--Attempt to shrink and regrow log file
-						EXEC @return_status = dbo.VLF_Fix @DBName = @DBName,  
-							@IncrementSizeMB = @IncrementSizeMB,
-							@TargetLogSizeMB = @LogFileSize,
-							@LogBackJobName = @LogBackJobName;
+-- Set log name and target size to value of parameter supplied, or existing size if no parameter value supplied
+SELECT TOP 1 @LogName = name, @TargetLogSizeMB = ROUND(ISNULL(@TargetLogSizeMB,[size]/128.0),0) FROM master.sys.master_files WHERE database_id = DB_ID(@DBName) AND type = 1 ORDER BY size DESC
 
-						--If previous shrink and regrow was unsuccessful regrow to original size without shrinking
-                        SELECT  @CurrentLogFileSize = ( size / 128 )
-                        FROM    master.sys.master_files
-                        WHERE   type_desc = 'log'
-                                AND DB_NAME(database_id) = @DBName
+-- Get VLF info and store in temporary table
+SET @dbccquery = REPLACE(REPLACE(
+		'DBCC loginfo ("{{DatabaseName}}") WITH NO_INFOMSGS, TABLERESULTS'
+		,'"','''')
+		,'{{DatabaseName}}', @dbname)
 
-                        IF @LogFileSize > @CurrentLogFileSize
-						BEGIN 
-                            EXEC dbo.VLF_Fix
-                                @DBName = @DBName ,
-                                @IncrementSizeMB = @IncrementSizeMB ,
-                                @TargetLogSizeMB = @LogFileSize ,
-								@LogBackJobName= @LogBackJobName;
-						END
-							
-						--Record the Auto Fix info to a table
-						INSERT INTO dbo.VLFAutoFix (DBName, CurrentVLFCount, LogFileSizeMBs)
-						VALUES (@DBName, @VLFCount, @LogFileSize);
-					END
+INSERT INTO #VLFInfo
+EXEC (@DBCCQuery)
 
-				TRUNCATE TABLE #Events;
-			END
-		FETCH NEXT FROM vlfcursor INTO @DBName, @VLFCount, @LogFileSize;
-	END
+SELECT @VLFCount = COUNT(*) 
+FROM #VLFInfo
 
-CLOSE vlfcursor;
-DEALLOCATE vlfcursor;
+SELECT TOP 1 @CurrentLogFileSizeMB = ROUND([size]/128.0,0) 
+FROM master.sys.master_files 
+WHERE database_id = DB_ID(@DBName) 
+	AND type = 1 
+ORDER BY size DESC
 
-DROP TABLE #VLFInfo;
-DROP TABLE #VLFCountResults;
-DROP TABLE #Events;
+-- Run the shrinking loop
+WHILE ( (GETDATE()<@CutOffTime) AND ((@CurrentLogFileSizeMB > 100) OR (@VLFCount > 8)) AND (@VLFCount > 2))
+BEGIN
+	-- Run the shrink command only if the most recent log VLF is not active      
+	IF ( (SELECT TOP 1 Status FROM #VLFInfo ORDER BY StartOffset DESC)<>2 )
+		BEGIN
+			EXEC sys.sp_executesql @sqlcmd
+		END
+	-- Reset values          
+	TRUNCATE TABLE #VLFInfo 
+	     
+	INSERT INTO #VLFInfo
+	EXEC (@DBCCQuery)
+
+	SELECT @VLFCount = COUNT(*) 
+	FROM #VLFInfo
+
+	SELECT TOP 1 @CurrentLogFileSizeMB = ROUND([size]/128.0,0) 
+	FROM master.sys.master_files 
+	WHERE database_id = DB_ID(@DBName) 
+		AND type = 1 
+	ORDER BY size DESC
+	
+	SET @Delay = @Delay + @DelayIncrementSecs
+	SET @DelayTime = DATEADD(s,@Delay,GETDATE())
+	
+	PRINT 'Waiting for ' + CONVERT(VARCHAR(99),@Delay) + ' seconds ...'
+	PRINT 'Current log file size is ' + CONVERT(VARCHAR(99),@CurrentLogFileSizeMB) + 'MB'
+	PRINT 'Current VLF count is ' + CONVERT(VARCHAR(99),@VLFCount)
+
+	WAITFOR TIME @DelayTime			     
+END
+
+SET @sqlcmd = '-- Target size in MB is ' + ISNULL(CONVERT(VARCHAR(99),@TargetLogSizeMB),'Unknown') + CHAR(13) + CHAR(10)
+SET @sqlcmd = @sqlcmd + '-- LogFile name is ' + @LogName + CHAR(13) + CHAR(10)
+SET @sqlcmd = @sqlcmd + '-- Ideal increment size is ' + @LogName + CHAR(13) + CHAR(10)
+
+-- Set increment size as close to ideal size as possible (this works better if a target size is supplied that is a multiple of the increment size obviously)
+SELECT @StepMB = ROUND(@TargetLogSizeMB / CEILING(@TargetLogSizeMB / @IncrementSizeMB),0) 
+		,@LoopCtr = CEILING(@TargetLogSizeMB / @IncrementSizeMB)     
+		,@TargetLogSizeMB = @StepMB
+
+WHILE (@LoopCtr > 0)
+BEGIN
+	SELECT @sqlcmd = @sqlcmd + 'ALTER DATABASE [' + @DBName + '] MODIFY FILE (NAME = N''' + @LogName + ''', SIZE = ' + CONVERT(VARCHAR(9),@TargetLogSizeMB) + 'MB);' + CHAR(13) + CHAR(10)
+	SELECT @TargetLogSizeMB = @TargetLogSizeMB + @StepMB,@LoopCtr = @LoopCtr - 1
+END
+
+IF ( ((GETDATE()<@CutOffTime) AND ((@CurrentLogFileSizeMB <= 100) OR (@VLFCount = 2))))
+BEGIN  
+	EXEC sys.sp_executesql @sqlcmd
+END  
+ELSE
+BEGIN
+	PRINT 'Unable to reduce VLFs sufficiently within the specified time period ...' 
+        
+	PRINT 'Please try again'
+	SET @SQLExceptionMsg = 'Current log file size is ' + CONVERT(VARCHAR(99),@CurrentLogFileSizeMB) + 'MB'
+		+ 'Current VLF count is ' + CONVERT(VARCHAR(99),@VLFCount)
+	RAISERROR(@SQLExceptionMsg, 16, 1)
+END  
+
+DROP TABLE #VLFInfo
 GO
