@@ -16,7 +16,7 @@
 --  Yes: create 1 new VLF equal to the growth size
 --  No: use the formula above
 ----------------------------------------------------------------------------------
-CREATE PROCEDURE dbo.VLF_AutoFix
+CREATE PROCEDURE [dbo].[VLF_AutoFix]
 (
 	@LookBackTime INT = 60 , -- Number of minutes to look back in the XE to see if things have changed
 	@VLFIdealOver INT = 20 , -- Number of over the Ideal number of VLFs is OK
@@ -29,17 +29,45 @@ CREATE PROCEDURE dbo.VLF_AutoFix
 AS
 SET NOCOUNT ON
 
-CREATE TABLE #VLFInfo
-(
-	RecoveryUnitID INT ,
-	FileID INT ,
-	FileSize BIGINT ,
-	StartOffset BIGINT ,
-	FSeqNo BIGINT ,
-	[Status] BIGINT ,
-	Parity BIGINT ,
-	CreateLSN NUMERIC(38)
-);
+-- Need to accomodate SQL Server 2012 (version 11.0)
+DECLARE @versionString            VARCHAR(20),
+        @serverVersion            DECIMAL(10,5),
+        @sqlServer2012Version    DECIMAL(10,5)
+ 
+SET        @versionString    = CAST(SERVERPROPERTY('productversion') AS VARCHAR(20))
+SET        @serverVersion = CAST(LEFT(@versionString,CHARINDEX('.', @versionString)) AS DECIMAL(10,5))
+SET        @sqlServer2012Version = 11.0 -- SQL Server 2012
+ 
+IF(@serverVersion >= @sqlServer2012Version)
+    BEGIN
+        -- Use the new version of the table  
+        CREATE TABLE #VLFInfo2012
+            (
+            [RecoveryUnitId]    INT NULL,
+            [FileId]            INT NULL,
+            [FileSize]            BIGINT NULL,
+            [StartOffset]        BIGINT NULL,
+            [FSeqNo]            INT NULL,
+            [Status]            INT NULL,
+            [Parity]            TINYINT NULL,
+            [CreateLSN]            NUMERIC(25, 0) NULL
+            )
+    END  
+ELSE  
+    BEGIN
+        -- Use the old version of the table
+        CREATE TABLE #VLFInfo2008
+            (
+            [FileId]            INT NULL,
+            [FileSize]            BIGINT NULL,
+            [StartOffset]        BIGINT NULL,
+            [FSeqNo]            INT NULL,
+            [Status]            INT NULL,
+            [Parity]            TINYINT NULL,
+            [CreateLSN]            NUMERIC(25, 0) NULL
+            )
+ 
+    END
 	 
 CREATE TABLE #VLFCountResults
 	(
@@ -132,8 +160,13 @@ WHILE ( @@fetch_status <> -1 )
 
 CLOSE vlfcursor;
 DEALLOCATE vlfcursor;
-
-DROP TABLE #VLFInfo;
+IF(@serverVersion >= @sqlServer2012Version)
+    BEGIN
+DROP TABLE #VLFInfo2012;
+END
+ELSE
+    BEGIN
+DROP TABLE #VLFInfo2008;
+END
 DROP TABLE #VLFCountResults;
 DROP TABLE #Events;
-GO
