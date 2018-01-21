@@ -22,7 +22,26 @@ CREATE TABLE #VLFSummary
 DECLARE @MajorVersion            VARCHAR(20)
  
 SET        @MajorVersion    = CAST(SERVERPROPERTY('ProductMajorVersion') AS tinyint)
- 
+
+-- Solution to get the major version on non-updated / patched SQL Servers.
+-- SERVERPROPERTY('ProductMajorVersion') was first implemented in late 2015
+IF (@MajorVersion IS NULL)
+    BEGIN
+        CREATE TABLE #checkversion (
+            version nvarchar(128),
+            common_version AS SUBSTRING(version, 1, CHARINDEX('.', version) + 1 ),
+            major AS PARSENAME(CONVERT(VARCHAR(32), version), 4),
+            minor AS PARSENAME(CONVERT(VARCHAR(32), version), 3),
+            build AS PARSENAME(CONVERT(varchar(32), version), 2),
+            revision AS PARSENAME(CONVERT(VARCHAR(32), version), 1)
+        );
+
+        INSERT INTO #checkversion (version)
+        SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) ;
+
+        SET @MajorVersion = (SELECT TOP 1 CAST(Major AS TINYINT) from #checkversion)        
+    END
+
 IF(@MajorVersion >= 11)
     BEGIN
         -- Use the new version of the table  
@@ -131,5 +150,3 @@ FROM #VLFSummary
  
 DROP TABLE #VLFSummary  
 GO
-
-
